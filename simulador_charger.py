@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QTimer
 import qasync
+import json
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -25,15 +26,15 @@ class CP_Simulator(BaseChargePoint):
         self.transaction_id = None
         self.gui = gui
         self.charging = False
-        self.heartbeat_interval = 60
+        self.heartbeat_interval = 30
+        self.data_transfer_interval = 30  # Intervalo para DataTransfer (segundos)
         self.status = ChargePointStatus.available
         self.connector_id = 1
-        self.connected = True  # Flag para controlar o estado da conexão
+        self.connected = True
 
     async def start(self):
-        # Envia o BootNotification inicial
+        # BootNotification inicial
         asyncio.create_task(super().start())
-
         try:
             self.gui.log_message("🔌 Enviando BootNotification inicial...")
             response = await self.call(call.BootNotification(
@@ -48,10 +49,9 @@ class CP_Simulator(BaseChargePoint):
             self.connected = False
             return
 
-
-        # Inicia tarefa de heartbeat periódico
+        # Inicia tarefas periódicas
         asyncio.create_task(self.periodic_heartbeat())
-        
+        asyncio.create_task(self.periodic_data_transfer())
 
     async def periodic_heartbeat(self):
         while self.connected:
@@ -59,17 +59,38 @@ class CP_Simulator(BaseChargePoint):
             if not self.charging and self.connected:
                 await self.send_heartbeat()
 
+    async def periodic_data_transfer(self):
+        while self.connected:
+            await asyncio.sleep(self.data_transfer_interval)
+            if not self.charging and self.connected:
+                # Exemplo de dados customizados
+                payload = {"timestamp": datetime.utcnow().isoformat(), "status": self.status.name}
+                await self.send_data_transfer(vendor_id="Simulator", message_id="PeriodicStatus", data=payload)
+
     async def send_heartbeat(self):
         try:
-            request = call.Heartbeat()
-            await self.call(request)
+            await self.call(call.Heartbeat())
             self.gui.log_message("💓 Heartbeat enviado")
         except websockets.exceptions.ConnectionClosed:
             self.gui.log_message("❌ Conexão fechada durante heartbeat")
             self.connected = False
         except Exception as e:
-            self.gui.log_message(f"❌ Erro ao enviar heartbeat: {str(e)}")
+            self.gui.log_message(f"❌ Erro ao enviar heartbeat: {e}")
             self.connected = False
+
+    async def send_data_transfer(self, vendor_id: str, message_id: str, data):
+        """
+        Envia uma requisição DataTransfer ao CSMS.
+        """
+        try:
+            response = await self.call(call.DataTransfer(vendor_id=vendor_id, message_id=message_id, data=json.dumps(data)
+            ))
+            self.gui.log_message(f"📤 DataTransfer enviado: vendor_id={vendor_id}, message_id={message_id}, status={response.status}")
+        except websockets.exceptions.ConnectionClosed:
+            self.gui.log_message("❌ Conexão fechada durante DataTransfer")
+            self.connected = False
+        except Exception as e:
+            self.gui.log_message(f"❌ Erro ao enviar DataTransfer: {e}")
 
     @on('BootNotification')
     async def on_boot_notification(self, charge_point_model, charge_point_vendor, **kwargs):
@@ -83,9 +104,7 @@ class CP_Simulator(BaseChargePoint):
     @on('Authorize')
     async def on_authorize(self, id_tag, **kwargs):
         self.gui.log_message(f"🔑 Authorize recebido para tag {id_tag}")
-        return call_result.Authorize(
-            id_tag_info={"status": AuthorizationStatus.accepted}
-        )
+        return call_result.Authorize(id_tag_info={"status": AuthorizationStatus.accepted})
 
     @on('RemoteStartTransaction')
     async def on_remote_start_transaction(self, connector_id, id_tag, **kwargs):
@@ -111,33 +130,18 @@ class CP_Simulator(BaseChargePoint):
         self.gui.log_message(f"📊 StatusNotification: {status} (Erro: {error_code})")
         return call_result.StatusNotification()
     
-    @on('Reset')
-    async def on_reset(self, type, **kwargs):
-        agora = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        self.gui.log_message(f"🔄 Reset recebido (tipo: {type}) às {agora}")
+    @on('DataTransfer')
+    async def on_data_transfer(self, vendor_id, message_id, data, **kwargs):
+        """
+        Trata mensagens DataTransfer enviadas pelo CSMS.
+        """
+        self.gui.log_message(f"📲 DataTransfer recebido (vendor_id={vendor_id}, message_id={message_id}) com dados: {data}")
+        # Responde aceitanto e ecoando os dados
+        return call_result.DataTransfer(
+            status="Accepted",
+            data=data
+        )
 
-        # Agenda o “reboot” em background, sem bloquear o on_reset
-        asyncio.get_event_loop().create_task(self._simulate_reboot())
-
-        # Responde imediatamente ao CSMS
-        return call_result.Reset(status=ResetStatus.accepted)
-
-    async def _simulate_reboot(self):
-        # Pequena pausa para simular boot
-        await asyncio.sleep(1)
-
-        # Agora sim, envie o BootNotification como CALL, esperando resposta
-        self.gui.log_message("🔌 Enviando BootNotification pós-reset…")
-        try:
-            response = await self.call(call.BootNotification(
-                charge_point_model="Simulator",
-                charge_point_vendor="Example",
-                firmware_version="1.0.0"
-            ))
-            self.gui.log_message(f"✅ BootNotification aceito: {response.status}")
-        except Exception as e:
-            self.gui.log_message(f"❌ Falha no BootNotification pós-reset: {e}")
-            
     @on('*')
     async def on_any_other_action(self, **kwargs):
         self.gui.log_message("⚠️ Ação não suportada recebida")
@@ -145,35 +149,22 @@ class CP_Simulator(BaseChargePoint):
 
     async def start_charging_sequence(self, id_tag):
         if self.charging:
-            self.gui.log_message("⚠️ Carregamento já em andamento. Ignorando novo pedido.")
+            self.gui.log_message("⚠️ Carregamento já em andamento.")
             return
-            
         self.charging = True
         self.gui.update_charging_status("Carregando...")
-        
-        # Envia status de preparação
         await self.send_status_notification(ChargePointStatus.preparing)
         await asyncio.sleep(2)
-        
-        # Inicia transação
         await self.send_start_transaction(id_tag)
         await self.send_status_notification(ChargePointStatus.charging)
-        
-        # Simula valores de medidor
         await self.simulate_meter_values()
-        
-        # Se ainda está carregando, encerra a transação
         if self.charging:
-            # Usando "Local" para término automático
             await self.send_stop_transaction(reason="Local")
             await self.send_status_notification(ChargePointStatus.available)
             self.gui.update_charging_status("Disponível")
-        
         self.charging = False
 
     async def send_status_notification(self, status):
-        self.status = status
-        self.gui.log_message(f"📊 Enviando StatusNotification: {status.value}")
         request = call.StatusNotification(
             connector_id=self.connector_id,
             error_code="NoError",
@@ -186,10 +177,9 @@ class CP_Simulator(BaseChargePoint):
             self.gui.log_message("❌ Conexão fechada durante envio de status")
             self.connected = False
         except Exception as e:
-            self.gui.log_message(f"❌ Erro ao enviar status: {str(e)}")
+            self.gui.log_message(f"❌ Erro ao enviar status: {e}")
 
     async def send_start_transaction(self, id_tag):
-        self.gui.log_message("🚗 Iniciando transação de carregamento")
         request = call.StartTransaction(
             connector_id=self.connector_id,
             id_tag=id_tag,
@@ -205,7 +195,7 @@ class CP_Simulator(BaseChargePoint):
             self.connected = False
             self.charging = False
         except Exception as e:
-            self.gui.log_message(f"❌ Erro ao iniciar transação: {str(e)}")
+            self.gui.log_message(f"❌ Erro ao iniciar transação: {e}")
             self.charging = False
 
     async def simulate_meter_values(self):
@@ -213,11 +203,9 @@ class CP_Simulator(BaseChargePoint):
         for i in range(1, 11):
             if not self.charging or not self.connected:
                 break
-                
             await asyncio.sleep(3)
             energy = i * 150
             total_energy += energy
-            
             request = call.MeterValues(
                 connector_id=self.connector_id,
                 transaction_id=self.transaction_id,
@@ -238,17 +226,19 @@ class CP_Simulator(BaseChargePoint):
                 self.connected = False
                 break
             except Exception as e:
-                self.gui.log_message(f"❌ Erro ao enviar medição: {str(e)}")
+                self.gui.log_message(f"❌ Erro ao enviar medição: {e}")
                 break
 
     async def send_stop_transaction(self, reason="Remote"):
-        self.gui.log_message(f"🛑 Encerrando transação de carregamento (Motivo: {reason})")
+        """
+        Encerra a transação de carregamento e envia StopTransaction.
+        """
         request = call.StopTransaction(
             transaction_id=self.transaction_id,
             id_tag=self.id_tag,
-            meter_stop=1500,
+            meter_stop=0,
             timestamp=datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
-            reason=reason  # Usando o valor correto
+            reason=reason
         )
         try:
             await self.call(request)
@@ -258,101 +248,88 @@ class CP_Simulator(BaseChargePoint):
             self.gui.log_message("❌ Conexão fechada durante parada de transação")
             self.connected = False
         except Exception as e:
-            self.gui.log_message(f"❌ Erro ao parar transação: {str(e)}")
+            self.gui.log_message(f"❌ Erro ao parar transação: {e}")
 
+    async def resume_connection(self, new_connection):
+        """
+        Reconecta sem reenviar BootNotification:
+        atualiza a conexão interna do BaseChargePoint e retoma o heartbeat.
+        """
+        self._connection = new_connection
+        self.connected = True
+        self.gui.log_message("🔄 Reconectado ao servidor, reiniciando listener e retomando heartbeat...")
+        asyncio.create_task(super().start())
+        asyncio.create_task(self.periodic_heartbeat())
 
 class EVChargerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Simulador de Carregador VE - OCPP 1.6")
         self.setGeometry(100, 100, 800, 600)
-        
-        # Variáveis de estado
+
         self.cp = None
         self.websocket = None
-        self.charging = False
-        self.energy_wh = 0
         self.power_w = 0
-        
-        # Layout principal
+        self.energy_wh = 0
+
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
-        
-        # Grupo de configuração
+
+        # Configurações
         config_group = QGroupBox("Configuração do Carregador")
         config_layout = QVBoxLayout()
-        
-        # ID do carregador
         id_layout = QHBoxLayout()
         id_layout.addWidget(QLabel("ID do Carregador:"))
         self.charger_id_input = QLineEdit("CP_SIMULATOR01")
         id_layout.addWidget(self.charger_id_input)
         config_layout.addLayout(id_layout)
-        
-        # URL do servidor
         url_layout = QHBoxLayout()
         url_layout.addWidget(QLabel("URL do Servidor:"))
         self.server_url_input = QLineEdit("ws://172.18.3.132:9000/ws/")
-        # self.server_url_input = QLineEdit("ws://ocpp.monitforce.pt:9001/ws/")
         url_layout.addWidget(self.server_url_input)
         config_layout.addLayout(url_layout)
-        
-        # Botão de conexão
         self.connect_button = QPushButton("Conectar")
         self.connect_button.clicked.connect(self.toggle_connection)
         config_layout.addWidget(self.connect_button)
-        
         config_group.setLayout(config_layout)
         main_layout.addWidget(config_group)
-        
-        # Grupo de status
+
+        # Status
         status_group = QGroupBox("Status do Carregador")
         status_layout = QVBoxLayout()
-        
-        # Status de conexão
         self.connection_status = QLabel("Desconectado")
         self.connection_status.setStyleSheet("color: red; font-weight: bold;")
         status_layout.addWidget(self.connection_status)
-        
-        # Status de carregamento
         self.charging_status = QLabel("Desconectado")
         self.charging_status.setStyleSheet("font-weight: bold;")
         status_layout.addWidget(self.charging_status)
-        
-        # Informações de energia
         energy_layout = QHBoxLayout()
         energy_layout.addWidget(QLabel("Potência Atual:"))
         self.power_label = QLabel("0 W")
         energy_layout.addWidget(self.power_label)
-        
         energy_layout.addWidget(QLabel("Energia Total:"))
         self.energy_label = QLabel("0 Wh")
         energy_layout.addWidget(self.energy_label)
         status_layout.addLayout(energy_layout)
-        
         status_group.setLayout(status_layout)
         main_layout.addWidget(status_group)
-        
-        # Grupo de controle
+
+        # Controles
         control_group = QGroupBox("Controles")
         control_layout = QHBoxLayout()
-        
-        # Botões de controle
         self.start_button = QPushButton("Iniciar Carregamento")
         self.start_button.clicked.connect(self.start_charging)
         self.start_button.setEnabled(False)
         control_layout.addWidget(self.start_button)
-        
         self.stop_button = QPushButton("Parar Carregamento")
         self.stop_button.clicked.connect(self.stop_charging)
         self.stop_button.setEnabled(False)
         control_layout.addWidget(self.stop_button)
-        
         control_group.setLayout(control_layout)
         main_layout.addWidget(control_group)
-        
-        # Grupo de logs
+
+        # Logs
         log_group = QGroupBox("Log de Mensagens")
         log_layout = QVBoxLayout()
         self.log_display = QTextEdit()
@@ -360,12 +337,14 @@ class EVChargerGUI(QMainWindow):
         log_layout.addWidget(self.log_display)
         log_group.setLayout(log_layout)
         main_layout.addWidget(log_group, 1)
-        
-        # Timer para atualizar a interface
+
+        # Timers
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self.update_ui)
         self.ui_timer.start(500)
-        
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.monitor_connection())
+
         self.log_message("✅ Aplicação iniciada. Configure e conecte ao servidor OCPP.")
 
     def log_message(self, message):
@@ -389,7 +368,6 @@ class EVChargerGUI(QMainWindow):
     def update_ui(self):
         self.power_label.setText(f"{self.power_w} W")
         self.energy_label.setText(f"{self.energy_wh} Wh")
-        
         if self.cp and self.cp.charging:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -400,40 +378,50 @@ class EVChargerGUI(QMainWindow):
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
 
-    def toggle_connection(self):
-        if self.cp:
-            self.disconnect_from_server()
-        else:
-            self.connect_to_server()
+    async def monitor_connection(self):
+        while True:
+            await asyncio.sleep(5)
+            if self.cp and not self.cp.connected:
+                self.log_message("🔄 Conexão perdida. Tentando reconectar sem BootNotification...")
+                self.connection_status.setText("Reconectando...")
+                self.connection_status.setStyleSheet("color: orange; font-weight: bold;")
+                try:
+                    await self.websocket.close()
+                except:
+                    pass
+                charger_id = self.charger_id_input.text()
+                server_url = self.server_url_input.text().rstrip('/') + '/' + charger_id
+                try:
+                    self.websocket = await websockets.connect(server_url, subprotocols=["ocpp1.6"])
+                    await self.cp.resume_connection(self.websocket)
+                    self.connection_status.setText("Conectado")
+                    self.connection_status.setStyleSheet("color: green; font-weight: bold;")
+                    self.log_message("✅ Reconectado com sucesso sem BootNotification.")
+                except Exception as e:
+                    self.log_message(f"❌ Falha ao reconectar: {e}")
 
     async def async_connect_to_server(self):
         charger_id = self.charger_id_input.text()
-        server_url = self.server_url_input.text() + charger_id
-        
+        server_url = self.server_url_input.text().rstrip('/') + '/' + charger_id
         while True:
             try:
-                self.log_message(f"🌐 Tentando conectar ao servidor em {server_url}...")
+                self.log_message(f"🌐 Tentando conectar em {server_url}...")
                 self.websocket = await websockets.connect(server_url, subprotocols=["ocpp1.6"])
                 self.cp = CP_Simulator(charger_id, self.websocket, self)
                 self.connection_status.setText("Conectado")
                 self.connection_status.setStyleSheet("color: green; font-weight: bold;")
                 self.log_message("✅ Conectado com sucesso ao servidor OCPP!")
-                self.update_charging_status("Disponível")
-
-                # Inicia o ChargePoint
                 await self.cp.start()
-                break  # Sai do loop de reconexão
-
+                break
             except Exception as e:
-                self.log_message(f"❌ Falha na conexão: {str(e)}")
+                self.log_message(f"❌ Falha na conexão: {e}")
                 self.connection_status.setText("Erro de conexão")
                 self.connection_status.setStyleSheet("color: red; font-weight: bold;")
-                self.cp = None
-
-                if self.websocket:
+                try:
                     await self.websocket.close()
-
-                await asyncio.sleep(5)  # espera 5s antes de tentar de novo
+                except:
+                    pass
+                await asyncio.sleep(5)
 
     def connect_to_server(self):
         loop = asyncio.get_event_loop()
@@ -454,6 +442,12 @@ class EVChargerGUI(QMainWindow):
             self.log_message("🔌 Desconectado do servidor OCPP")
         self.connect_button.setText("Conectar")
 
+    def toggle_connection(self):
+        if self.cp:
+            self.disconnect_from_server()
+        else:
+            self.connect_to_server()
+
     def start_charging(self):
         if self.cp and not self.cp.charging:
             self.log_message("⚡ Iniciando carregamento localmente...")
@@ -465,19 +459,17 @@ class EVChargerGUI(QMainWindow):
             self.log_message("🛑 Parando carregamento localmente...")
             self.cp.charging = False
             loop = asyncio.get_event_loop()
-            # Usando "Local" para parada manual através da interface
             loop.create_task(self.cp.send_stop_transaction(reason="Local"))
             loop.create_task(self.cp.send_status_notification(ChargePointStatus.available))
             self.update_charging_status("Disponível")
+
 
 def main():
     app = QApplication(sys.argv)
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
-    
     window = EVChargerGUI()
     window.show()
-    
     with loop:
         loop.run_forever()
 

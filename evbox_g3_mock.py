@@ -186,6 +186,13 @@ class EVBoxG3Simulator(BaseChargePoint):
 
     # ---------------------- Fluxo de sessão -----------------------
     async def start_session_flow(self, id_tag: str):
+        """
+        Inicia um ciclo de sessão simulando o EVBox G3.
+
+        Importante: só continua para Charging se o CSMS aceitar o StartTransaction.
+        Caso o CSMS devolva transaction_id <= 0 (ou erro), a sessão é abortada
+        e o mock volta para Available.
+        """
         if self.charging:
             self.gui.log_message("⚠️ Sessão já em andamento.")
             return
@@ -195,8 +202,19 @@ class EVBoxG3Simulator(BaseChargePoint):
         await self.send_evb_datatransfer("Preparing", led_color="Off", plugged=0)
         await asyncio.sleep(2)
 
-        # 2) StartTransaction **sem Authorize prévio**
+        # 2) StartTransaction (sem Authorize prévio — comportamento EVBox)
         await self.send_start_transaction(id_tag)
+
+        # Verifica se o CSMS aceitou (transaction_id > 0)
+        tx_ok = isinstance(self.tx_id, int) and self.tx_id > 0
+        if not tx_ok:
+            self.gui.log_message("⛔ StartTransaction rejeitado pelo CSMS (idTag inválida ou não autorizada).")
+            # Volta para Available e encerra o fluxo
+            await self.send_status(ChargePointStatus.available)
+            await self.send_evb_datatransfer("Available", led_color="Green", plugged=0)
+            self.charging = False
+            self.gui.update_charging_status("Disponível")
+            return
 
         # 3) SuspendedEVSE (curto), depois Charging
         await self.send_status(ChargePointStatus.suspended_evse, info="B;425")
@@ -214,16 +232,19 @@ class EVBoxG3Simulator(BaseChargePoint):
             if not self.charging or not self.connected:
                 break
             await asyncio.sleep(10)
-            # Incrementa energia simulada
-            inc = 1_280  # ~1.28 kWh por amostra (exemplo)
+
+            # Incrementa energia simulada (exemplo)
+            inc = 1_280  # ~1.28 kWh por amostra
             await self.send_meter_values(increment_wh=inc)
-            # Atualiza GUI com potência estimada (apenas visual)
-            # aproximando 1280 Wh em 10s => ~460.8 kW (é só ilustração; ajuste se quiser)
-            est_power_w = int(inc * 3600 / 10)
+
+            # Atualiza GUI com potência estimada (visual)
+            est_power_w = int(inc * 3600 / 10)  # 10s no sleep acima
             self.gui.update_energy_values(est_power_w, self.energy_wh_counter)
+
             # DataTransfer de estado
             await self.send_evb_datatransfer("Charging", led_color="Blue", plugged=1)
 
+        # 5) Finalização
         if self.charging:
             await self.send_stop_transaction(reason="Local")
             await self.send_status(ChargePointStatus.finishing)
@@ -233,6 +254,7 @@ class EVBoxG3Simulator(BaseChargePoint):
             await self.send_evb_datatransfer("Available", led_color="Green", plugged=0)
             self.charging = False
             self.gui.update_charging_status("Disponível")
+
 
     async def stop_session(self, reason: str = "Local"):
         if not self.charging:
@@ -281,7 +303,7 @@ class EVBoxG3Simulator(BaseChargePoint):
         except Exception as e:
             self.gui.log_message(f"❌ Falha ao enviar DataTransfer: {e}")
 
-    async def send_start_transaction(self, id_tag: str):
+    async def send_start_transaction(self, id_tag: str) -> bool:
         try:
             req = call.StartTransaction(
                 connector_id=self.connector_id,
@@ -290,10 +312,30 @@ class EVBoxG3Simulator(BaseChargePoint):
                 meter_start=self.energy_wh_counter,
             )
             resp = await self.call(req)
-            self.tx_id = resp.transaction_id
-            self.gui.log_message(f"⚡ StartTransaction aceito. tx_id={self.tx_id} | meter_start={self.energy_wh_counter} Wh")
+    
+            # Lê status dentro de id_tag_info (pode vir dict ou objeto)
+            info = getattr(resp, 'id_tag_info', None)
+            if isinstance(info, dict):
+                status_val = info.get('status')
+            else:
+                status_val = getattr(info, 'status', None)
+                status_val = getattr(status_val, 'value', status_val)  # enum -> string
+    
+            tx_id = getattr(resp, 'transaction_id', 0)
+            accepted = (str(status_val).lower() == 'accepted' and isinstance(tx_id, int) and tx_id > 0)
+    
+            if not accepted:
+                self.gui.log_message(f"⛔ StartTransaction rejeitado. status={status_val} tx={tx_id}")
+                self.tx_id = None
+                return False
+    
+            self.tx_id = tx_id
+            self.gui.log_message(f"⚡ StartTransaction ACEITO. tx_id={self.tx_id} | meter_start={self.energy_wh_counter} Wh")
+            return True
+    
         except Exception as e:
             self.gui.log_message(f"❌ Erro no StartTransaction: {e}")
+            return False
 
     async def send_meter_values(self, increment_wh: int = 1000):
         try:
@@ -444,7 +486,7 @@ class EVChargerGUI(QMainWindow):
         self.power_w = 0
         self.energy_wh = 0
 
-        self.id_tag = "DAIANE_EVB123"
+        self.id_tag = "DAIANE_EVB1234"
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)

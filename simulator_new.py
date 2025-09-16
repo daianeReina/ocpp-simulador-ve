@@ -5,7 +5,14 @@ import sys
 from datetime import datetime, timezone
 from ocpp.v16 import ChargePoint as BaseChargePoint
 from ocpp.v16 import call, call_result
-from ocpp.v16.enums import RegistrationStatus, ChargePointStatus, AuthorizationStatus, ResetStatus, ConfigurationStatus
+from ocpp.v16.enums import (
+    RegistrationStatus,
+    ChargePointStatus,
+    AuthorizationStatus,
+    ResetStatus,
+    ConfigurationStatus,
+    DataTransferStatus,
+)
 from ocpp.routing import on
 from ocpp.messages import CallError
 from PyQt5.QtWidgets import (
@@ -16,6 +23,17 @@ from PyQt5.QtCore import QTimer
 import qasync
 import json
 
+from datetime import datetime, timezone
+
+def utcnow_iso():
+    # ISO 8601 com offset +00:00 (aceite em OCPP)
+    return datetime.now(timezone.utc).isoformat()
+
+def utcnow_z():
+    # Se preferir terminar com 'Z' (também comum em OCPP)
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
 # Configuração de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -23,6 +41,7 @@ class CP_Simulator(BaseChargePoint):
     def __init__(self, id, connection, gui):
         super().__init__(id, connection)
         self.id_tag = "ABC123456"
+        self.current_id_tag = None  # id_tag efetivo da sessão
         self.transaction_id = None
         self.gui = gui
         self.charging = False
@@ -31,6 +50,12 @@ class CP_Simulator(BaseChargePoint):
         self.status = ChargePointStatus.available
         self.connector_id = 1
         self.connected = True
+        self.authorize_required = True  # por padrão, requer Authorize
+
+        # --- contador de medição persistente (Wh) do "medidor" ---
+        # podes iniciar com 0 ou um valor realista
+        self.meter_wh_counter = 0
+        self.meter_start_wh = 0
 
     async def start(self):
         # BootNotification inicial
@@ -83,9 +108,14 @@ class CP_Simulator(BaseChargePoint):
         Envia uma requisição DataTransfer ao CSMS.
         """
         try:
-            response = await self.call(call.DataTransfer(vendor_id=vendor_id, message_id=message_id, data=json.dumps(data)
+            response = await self.call(call.DataTransfer(
+                vendor_id=vendor_id,
+                message_id=message_id,
+                data=json.dumps(data)
             ))
-            self.gui.log_message(f"📤 DataTransfer enviado: vendor_id={vendor_id}, message_id={message_id}, status={response.status}")
+            self.gui.log_message(
+                f"📤 DataTransfer enviado: vendor_id={vendor_id}, message_id={message_id}, status={response.status}"
+            )
         except websockets.exceptions.ConnectionClosed:
             self.gui.log_message("❌ Conexão fechada durante DataTransfer")
             self.connected = False
@@ -129,28 +159,62 @@ class CP_Simulator(BaseChargePoint):
     async def on_status_notification(self, connector_id, error_code, status, **kwargs):
         self.gui.log_message(f"📊 StatusNotification: {status} (Erro: {error_code})")
         return call_result.StatusNotification()
-    
+
     @on('DataTransfer')
     async def on_data_transfer(self, vendor_id, message_id, data, **kwargs):
         """
         Trata mensagens DataTransfer enviadas pelo CSMS.
         """
-        self.gui.log_message(f"📲 DataTransfer recebido (vendor_id={vendor_id}, message_id={message_id}) com dados: {data}")
-        # Responde aceitanto e ecoando os dados
+        self.gui.log_message(
+            f"📲 DataTransfer recebido (vendor_id={vendor_id}, message_id={message_id}) com dados: {data}"
+        )
+        # Responde aceitando e ecoando os dados
         return call_result.DataTransfer(
-            status="Accepted",
+            status=DataTransferStatus.accepted,
             data=data
         )
+    @on('GetConfiguration')
+    async def on_get_configuration(self, key=None, **kwargs):
+        """
+        Responde ao GetConfiguration do CSMS.
+        Usa valores internos do simulador e devolve keys pedidas ou todas.
+        """
+        # AuthorizeRequired = True  -> requer RFID (AutoStart OFF)
+        # AuthorizeRequired = False -> não requer RFID (AutoStart ON)
+        authorize_required = getattr(self, "authorize_required", True)
+
+        store = {
+            "AuthorizeRequired": ("true" if authorize_required else "false", False),
+            "MeterValuesSampleInterval": ("30", False),
+            "HeartbeatInterval": (str(self.heartbeat_interval), False),
+        }
+
+        requested = key or list(store.keys())
+        configuration_key, unknown_key = [], []
+
+        for k in requested:
+            if k in store:
+                val, ro = store[k]
+                configuration_key.append({"key": k, "value": val, "readonly": ro})
+            else:
+                unknown_key.append(k)
+
+        return call_result.GetConfiguration(
+            configuration_key=configuration_key,
+            unknown_key=unknown_key or None
+        )
+
     @on('ChangeConfiguration')
     async def on_change_configuration(self, key, value, **kwargs):
         if key == "AuthorizeRequired":
             self.authorize_required = value.lower() == "true"
-            self.gui.update_autostart_status(not self.authorize_required)  # true = autostart desativado
+            # true = requer authorize => autostart desativado
+            self.gui.update_autostart_status(not self.authorize_required)
             self.gui.log_message(f"🔧 Configuração atualizada: AuthorizeRequired = {self.authorize_required}")
             return call_result.ChangeConfiguration(status=ConfigurationStatus.accepted)
         self.gui.log_message(f"⚠️ Chave de configuração não suportada: {key}")
         return call_result.ChangeConfiguration(status=ConfigurationStatus.not_supported)
-    
+
     async def start_charging_sequence(self, id_tag):
         if self.charging:
             self.gui.log_message("⚠️ Carregamento já em andamento.")
@@ -178,24 +242,31 @@ class CP_Simulator(BaseChargePoint):
 
         self.charging = True
         self.gui.update_charging_status("Carregando...")
+
         await self.send_status_notification(ChargePointStatus.preparing)
         await asyncio.sleep(2)
+
+        # inicia transação com meter_start real
         await self.send_start_transaction(id_tag)
+
         await self.send_status_notification(ChargePointStatus.charging)
         await self.simulate_meter_values()
+
         if self.charging:
+            # amostra final opcional com contexto Transaction.End
+            await self.send_transaction_end_sample()
             await self.send_stop_transaction(reason="Local")
             await self.send_status_notification(ChargePointStatus.available)
             self.gui.update_charging_status("Disponível")
-        self.charging = False
 
+        self.charging = False
 
     async def send_status_notification(self, status):
         request = call.StatusNotification(
             connector_id=self.connector_id,
             error_code="NoError",
             status=status,
-            timestamp=datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            timestamp=utcnow_iso()
         )
         try:
             await self.call(request)
@@ -206,16 +277,22 @@ class CP_Simulator(BaseChargePoint):
             self.gui.log_message(f"❌ Erro ao enviar status: {e}")
 
     async def send_start_transaction(self, id_tag):
+        # Guardar id_tag desta sessão e o ponto de partida do medidor
+        self.current_id_tag = id_tag
+        self.meter_start_wh = self.meter_wh_counter
+
         request = call.StartTransaction(
             connector_id=self.connector_id,
             id_tag=id_tag,
-            meter_start=0,
-            timestamp=datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+            meter_start=self.meter_start_wh,  # usar valor real do medidor
+            timestamp=utcnow_iso()
         )
         try:
             response = await self.call(request)
             self.transaction_id = response.transaction_id
-            self.gui.log_message(f"📝 Transação iniciada com ID: {self.transaction_id}")
+            self.gui.log_message(
+                f"📝 Transação iniciada com ID: {self.transaction_id} (meter_start={self.meter_start_wh} Wh)"
+            )
         except websockets.exceptions.ConnectionClosed:
             self.gui.log_message("❌ Conexão fechada durante início de transação")
             self.connected = False
@@ -225,28 +302,51 @@ class CP_Simulator(BaseChargePoint):
             self.charging = False
 
     async def simulate_meter_values(self):
-        total_energy = 0
+        """
+        Simula medições incrementando o contador global do medidor (Wh).
+        A UI mostra a potência instantânea (W) e o total no medidor (Wh).
+        """
         for i in range(1, 11):
             if not self.charging or not self.connected:
                 break
             await asyncio.sleep(3)
-            energy = i * 150
-            total_energy += energy
+
+            # Potência instantânea "medida" neste passo
+            power_w = i * 150
+
+            # Como o passo tem 3s, Wh do passo ~= W * (3/3600)
+            step_wh = max(1, int(round(power_w * 3 / 3600)))
+
+            # Atualiza contador global do medidor
+            self.meter_wh_counter += step_wh
+
             request = call.MeterValues(
                 connector_id=self.connector_id,
                 transaction_id=self.transaction_id,
                 meter_value=[{
-                    "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                    "timestamp": utcnow_iso(),
                     "sampledValue": [
-                        {"value": str(energy), "unit": "W", "measurand": "Power.Active.Import", "context": "Sample.Periodic"},
-                        {"value": str(total_energy), "unit": "Wh", "measurand": "Energy.Active.Import.Register", "context": "Transaction.Begin"}
+                        {
+                            "value": str(power_w),
+                            "unit": "W",
+                            "measurand": "Power.Active.Import",
+                            "context": "Sample.Periodic"
+                        },
+                        {
+                            "value": str(self.meter_wh_counter),
+                            "unit": "Wh",
+                            "measurand": "Energy.Active.Import.Register",
+                            "context": "Sample.Periodic"
+                        }
                     ]
                 }]
             )
             try:
                 await self.call(request)
-                self.gui.log_message(f"🔋 Medição enviada: {energy}W (Total: {total_energy}Wh)")
-                self.gui.update_energy_values(energy, total_energy)
+                self.gui.log_message(
+                    f"🔋 Medição enviada: {power_w}W | meter={self.meter_wh_counter}Wh (+{step_wh}Wh)"
+                )
+                self.gui.update_energy_values(power_w, self.meter_wh_counter)
             except websockets.exceptions.ConnectionClosed:
                 self.gui.log_message("❌ Conexão fechada durante envio de medição")
                 self.connected = False
@@ -255,21 +355,48 @@ class CP_Simulator(BaseChargePoint):
                 self.gui.log_message(f"❌ Erro ao enviar medição: {e}")
                 break
 
+    async def send_transaction_end_sample(self):
+        """
+        Opcional: envia uma última amostra com o Register no fim da transação.
+        """
+        try:
+            await self.call(call.MeterValues(
+                connector_id=self.connector_id,
+                transaction_id=self.transaction_id,
+                meter_value=[{
+                    "timestamp": utcnow_iso(),
+                    "sampledValue": [
+                        {
+                            "value": str(self.meter_wh_counter),
+                            "unit": "Wh",
+                            "measurand": "Energy.Active.Import.Register",
+                            "context": "Transaction.End"
+                        }
+                    ]
+                }]
+            ))
+        except Exception:
+            pass
+
     async def send_stop_transaction(self, reason="Remote"):
         """
-        Encerra a transação de carregamento e envia StopTransaction.
+        Encerra a transação de carregamento e envia StopTransaction com meter_stop correto.
         """
         request = call.StopTransaction(
             transaction_id=self.transaction_id,
-            id_tag=self.id_tag,
-            meter_stop=1207,
-            timestamp=datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+            id_tag=self.current_id_tag or self.id_tag,
+            meter_stop=self.meter_wh_counter,  # valor real do medidor ao fim
+            timestamp=utcnow_iso(),
             reason=reason
         )
         try:
             await self.call(request)
+            consumo = self.meter_wh_counter - self.meter_start_wh
+            self.gui.log_message(
+                f"✅ Transação encerrada: meter_start={self.meter_start_wh}Wh, meter_stop={self.meter_wh_counter}Wh, consumo={consumo}Wh"
+            )
             self.transaction_id = None
-            self.gui.log_message("✅ Transação encerrada com sucesso")
+            self.current_id_tag = None
         except websockets.exceptions.ConnectionClosed:
             self.gui.log_message("❌ Conexão fechada durante parada de transação")
             self.connected = False
@@ -286,6 +413,7 @@ class CP_Simulator(BaseChargePoint):
         self.gui.log_message("🔄 Reconectado ao servidor, reiniciando listener e retomando heartbeat...")
         asyncio.create_task(super().start())
         asyncio.create_task(self.periodic_heartbeat())
+
 
 class EVChargerGUI(QMainWindow):
     def __init__(self):
@@ -318,7 +446,7 @@ class EVChargerGUI(QMainWindow):
         config_layout.addLayout(id_layout)
         url_layout = QHBoxLayout()
         url_layout.addWidget(QLabel("URL do Servidor:"))
-        self.server_url_input = QLineEdit("ws://172.18.3.132:9000/ws/") # Workstation
+        self.server_url_input = QLineEdit("ws://172.18.3.132:9000/ws/")  # Workstation
         # self.server_url_input = QLineEdit("ws://192.168.1.87:9000/ws/") # Home
         url_layout.addWidget(self.server_url_input)
         config_layout.addLayout(url_layout)
@@ -328,7 +456,6 @@ class EVChargerGUI(QMainWindow):
         config_group.setLayout(config_layout)
         main_layout.addWidget(config_group)
         self.id_tag = "DAIANE01"
-        
 
         # Status
         status_group = QGroupBox("Status do Carregador")
@@ -347,7 +474,7 @@ class EVChargerGUI(QMainWindow):
         energy_layout.addWidget(QLabel("Potência Atual:"))
         self.power_label = QLabel("0 W")
         energy_layout.addWidget(self.power_label)
-        energy_layout.addWidget(QLabel("Energia Total:"))
+        energy_layout.addWidget(QLabel("Energia Total (medidor):"))
         self.energy_label = QLabel("0 Wh")
         energy_layout.addWidget(self.energy_label)
         status_layout.addLayout(energy_layout)
@@ -416,7 +543,7 @@ class EVChargerGUI(QMainWindow):
         else:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
-    
+
     def update_autostart_status(self, enabled: bool):
         if enabled:
             self.autostart_status.setText("AutoStart: Ativo")
@@ -424,7 +551,6 @@ class EVChargerGUI(QMainWindow):
         else:
             self.autostart_status.setText("AutoStart: Inativo")
             self.autostart_status.setStyleSheet("color: red; font-weight: bold;")
-
 
     async def monitor_connection(self):
         while True:
@@ -508,6 +634,7 @@ class EVChargerGUI(QMainWindow):
             self.log_message("🛑 Parando carregamento localmente...")
             self.cp.charging = False
             loop = asyncio.get_event_loop()
+            loop.create_task(self.cp.send_transaction_end_sample())
             loop.create_task(self.cp.send_stop_transaction(reason="Local"))
             loop.create_task(self.cp.send_status_notification(ChargePointStatus.available))
             self.update_charging_status("Disponível")

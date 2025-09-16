@@ -5,7 +5,7 @@ import sys
 from datetime import datetime, timezone
 from ocpp.v16 import ChargePoint as BaseChargePoint
 from ocpp.v16 import call, call_result
-from ocpp.v16.enums import RegistrationStatus, ChargePointStatus, AuthorizationStatus, ResetStatus, ConfigurationStatus
+from ocpp.v16.enums import RegistrationStatus, ChargePointStatus, AuthorizationStatus, ResetStatus
 from ocpp.routing import on
 from ocpp.messages import CallError
 from PyQt5.QtWidgets import (
@@ -26,8 +26,8 @@ class CP_Simulator(BaseChargePoint):
         self.transaction_id = None
         self.gui = gui
         self.charging = False
-        self.heartbeat_interval = 900
-        self.data_transfer_interval = 900  # Intervalo para DataTransfer (segundos)
+        self.heartbeat_interval = 30
+        self.data_transfer_interval = 30  # Intervalo para DataTransfer (segundos)
         self.status = ChargePointStatus.available
         self.connector_id = 1
         self.connected = True
@@ -111,6 +111,50 @@ class CP_Simulator(BaseChargePoint):
         self.gui.log_message(f"⚡ RemoteStartTransaction recebido para tag {id_tag}")
         asyncio.create_task(self.start_charging_sequence(id_tag))
         return call_result.RemoteStartTransaction(status="Accepted")
+    
+    @on('StartTransaction')
+    async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp=None, transaction_id=None, **kwargs):
+        self.transaction_id = transaction_id
+        self.charging = True
+        self.gui.update_charging_status("Carregando (AutoStart)")
+        self.gui.log_message(f"📝 Transação iniciada com ID: {transaction_id}")
+
+        # Envia MeterValues simulados
+        total_energy = 0
+        for i in range(1, 4):
+            if not self.charging or not self.connected:
+                break
+            await asyncio.sleep(2)
+            energy = i * 150
+            total_energy += energy
+    
+            request = call.MeterValues(
+                connector_id=self.connector_id,
+                transaction_id=self.transaction_id,
+                meter_value=[{
+                    "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                    "sampledValue": [
+                        {"value": str(energy), "unit": "W", "measurand": "Power.Active.Import", "context": "Sample.Periodic"},
+                        {"value": str(total_energy), "unit": "Wh", "measurand": "Energy.Active.Import.Register", "context": "Transaction.Begin"}
+                    ]
+                }]
+            )
+            await self.call(request)
+            self.gui.log_message(f"🔋 Medição enviada: {energy}W (Total: {total_energy}Wh)")
+            self.gui.update_energy_values(energy, total_energy)
+    
+        # Envia StopTransaction localmente
+        self.gui.log_message("🛑 Parando carregamento localmente...")
+        await self.send_stop_transaction(reason="Local")
+        self.gui.update_charging_status("Disponível")
+        self.charging = False
+    
+        return call_result.StartTransaction(
+            transaction_id=transaction_id,
+            id_tag_info={"status": AuthorizationStatus.accepted}
+        )
+
+
 
     @on('RemoteStopTransaction')
     async def on_remote_stop_transaction(self, transaction_id, **kwargs):
@@ -141,40 +185,27 @@ class CP_Simulator(BaseChargePoint):
             status="Accepted",
             data=data
         )
-    @on('ChangeConfiguration')
-    async def on_change_configuration(self, key, value, **kwargs):
-        if key == "AuthorizeRequired":
-            self.authorize_required = value.lower() == "true"
-            self.gui.update_autostart_status(not self.authorize_required)  # true = autostart desativado
-            self.gui.log_message(f"🔧 Configuração atualizada: AuthorizeRequired = {self.authorize_required}")
-            return call_result.ChangeConfiguration(status=ConfigurationStatus.accepted)
-        self.gui.log_message(f"⚠️ Chave de configuração não suportada: {key}")
-        return call_result.ChangeConfiguration(status=ConfigurationStatus.not_supported)
+
     
     async def start_charging_sequence(self, id_tag):
         if self.charging:
             self.gui.log_message("⚠️ Carregamento já em andamento.")
             return
 
-        # Verifica se AutoStart está ativo (AuthorizeRequired = False)
-        if hasattr(self, "authorize_required") and not self.authorize_required:
-            self.gui.log_message("✅ AutoStart ativo — pulando verificação de tag.")
-            auth_status = AuthorizationStatus.accepted
-            id_tag = "autostart"
-        else:
-            self.gui.log_message(f"🔐 Solicitando autorização para tag {id_tag}...")
-            try:
-                response = await self.call(call.Authorize(id_tag=id_tag))
-                auth_status = response.id_tag_info["status"]
-            except Exception as e:
-                self.gui.log_message(f"❌ Erro ao solicitar autorização: {e}")
-                return
+        self.gui.log_message(f"🔐 Solicitando autorização para tag {id_tag}...")
+        try:
+            response = await self.call(call.Authorize(id_tag=id_tag))
+            auth_status = response.id_tag_info["status"]
+        except Exception as e:
+            self.gui.log_message(f"❌ Erro ao solicitar autorização: {e}")
+            return
 
-            if auth_status != AuthorizationStatus.accepted:
-                self.gui.log_message(f"❌ Tag {id_tag} não autorizada ({auth_status})")
-                self.update_charging_status("RFID não autorizado")
-                return
-            self.gui.log_message(f"✅ Tag {id_tag} autorizada!")
+        if auth_status != AuthorizationStatus.accepted:
+            self.gui.log_message(f"❌ Tag {id_tag} não autorizada ({auth_status})")
+            self.update_charging_status("RFID não autorizado")
+            return
+
+        self.gui.log_message(f"✅ Tag {id_tag} autorizada!")
 
         self.charging = True
         self.gui.update_charging_status("Carregando...")
@@ -262,7 +293,7 @@ class CP_Simulator(BaseChargePoint):
         request = call.StopTransaction(
             transaction_id=self.transaction_id,
             id_tag=self.id_tag,
-            meter_stop=1207,
+            meter_stop=0,
             timestamp=datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
             reason=reason
         )
@@ -307,28 +338,29 @@ class EVChargerGUI(QMainWindow):
         config_layout = QVBoxLayout()
         id_layout = QHBoxLayout()
         id_layout.addWidget(QLabel("ID do Carregador:"))
-        self.charger_id_input = QLineEdit("CP_SIMULATOR02")
+        self.charger_id_input = QLineEdit("CP_SIMULATOR01")
         id_layout.addWidget(self.charger_id_input)
+
         rfid_layout = QHBoxLayout()
         rfid_layout.addWidget(QLabel("ID da Tag RFID:"))
         self.rfid_input = QLineEdit("DAIANE01")
         rfid_layout.addWidget(self.rfid_input)
         config_layout.addLayout(rfid_layout)
-
         config_layout.addLayout(id_layout)
+
         url_layout = QHBoxLayout()
         url_layout.addWidget(QLabel("URL do Servidor:"))
-        self.server_url_input = QLineEdit("ws://172.18.3.132:9000/ws/") # Workstation
-        # self.server_url_input = QLineEdit("ws://192.168.1.87:9000/ws/") # Home
+        self.server_url_input = QLineEdit("ws://172.18.3.132:9000/ws/")
         url_layout.addWidget(self.server_url_input)
         config_layout.addLayout(url_layout)
+
         self.connect_button = QPushButton("Conectar")
         self.connect_button.clicked.connect(self.toggle_connection)
         config_layout.addWidget(self.connect_button)
+
         config_group.setLayout(config_layout)
         main_layout.addWidget(config_group)
         self.id_tag = "DAIANE01"
-        
 
         # Status
         status_group = QGroupBox("Status do Carregador")
@@ -339,10 +371,6 @@ class EVChargerGUI(QMainWindow):
         self.charging_status = QLabel("Desconectado")
         self.charging_status.setStyleSheet("font-weight: bold;")
         status_layout.addWidget(self.charging_status)
-        self.autostart_status = QLabel("AutoStart: Desconhecido")
-        self.autostart_status.setStyleSheet("color: orange; font-weight: bold;")
-        status_layout.addWidget(self.autostart_status)
-
         energy_layout = QHBoxLayout()
         energy_layout.addWidget(QLabel("Potência Atual:"))
         self.power_label = QLabel("0 W")
@@ -357,14 +385,23 @@ class EVChargerGUI(QMainWindow):
         # Controles
         control_group = QGroupBox("Controles")
         control_layout = QHBoxLayout()
+
         self.start_button = QPushButton("Iniciar Carregamento")
         self.start_button.clicked.connect(self.start_charging)
         self.start_button.setEnabled(False)
         control_layout.addWidget(self.start_button)
+
         self.stop_button = QPushButton("Parar Carregamento")
         self.stop_button.clicked.connect(self.stop_charging)
         self.stop_button.setEnabled(False)
         control_layout.addWidget(self.stop_button)
+
+        # 👉 Botão AutoStart
+        self.autostart_button = QPushButton("⚡ AutoStart (simular)")
+        self.autostart_button.clicked.connect(self.trigger_autostart)
+        self.autostart_button.setEnabled(True)
+        control_layout.addWidget(self.autostart_button)
+
         control_group.setLayout(control_layout)
         main_layout.addWidget(control_group)
 
@@ -385,7 +422,7 @@ class EVChargerGUI(QMainWindow):
         loop.create_task(self.monitor_connection())
 
         self.log_message("✅ Aplicação iniciada. Configure e conecte ao servidor OCPP.")
-
+    
     def log_message(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_display.append(f"[{timestamp}] {message}")
@@ -407,23 +444,22 @@ class EVChargerGUI(QMainWindow):
     def update_ui(self):
         self.power_label.setText(f"{self.power_w} W")
         self.energy_label.setText(f"{self.energy_wh} Wh")
-        if self.cp and self.cp.charging:
+
+        if not self.cp:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(False)
+            return
+
+        # Atualiza os botões conforme o status do carregador
+        if self.cp.charging:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
-        elif self.cp and self.cp.status == ChargePointStatus.available:
+        elif self.cp.status == ChargePointStatus.available:
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
         else:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
-    
-    def update_autostart_status(self, enabled: bool):
-        if enabled:
-            self.autostart_status.setText("AutoStart: Ativo")
-            self.autostart_status.setStyleSheet("color: green; font-weight: bold;")
-        else:
-            self.autostart_status.setText("AutoStart: Inativo")
-            self.autostart_status.setStyleSheet("color: red; font-weight: bold;")
 
 
     async def monitor_connection(self):
@@ -490,6 +526,14 @@ class EVChargerGUI(QMainWindow):
             self.log_message("🔌 Desconectado do servidor OCPP")
         self.connect_button.setText("Conectar")
 
+    def trigger_autostart(self):
+        if self.cp:
+            self.log_message("⚡ Enviando StatusNotification com status 'Preparing' para simular AutoStart...")
+            loop = asyncio.get_event_loop()
+            loop.create_task(self.cp.send_status_notification(status=ChargePointStatus.preparing))
+        else:
+            self.log_message("❌ Carregador não está conectado.")
+    
     def toggle_connection(self):
         if self.cp:
             self.disconnect_from_server()
@@ -511,7 +555,6 @@ class EVChargerGUI(QMainWindow):
             loop.create_task(self.cp.send_stop_transaction(reason="Local"))
             loop.create_task(self.cp.send_status_notification(ChargePointStatus.available))
             self.update_charging_status("Disponível")
-
 
 def main():
     app = QApplication(sys.argv)
